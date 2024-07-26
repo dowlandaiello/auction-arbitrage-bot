@@ -3,6 +3,7 @@ Implements an arbitrage strategy with an arbitrary number
 of hops using all available providers.
 """
 
+import traceback
 import asyncio
 import random
 from typing import List, Union, Optional, Self, AsyncGenerator
@@ -41,7 +42,6 @@ class State:
     """
 
     balance: Optional[int]
-    liquidity_cache: dict[Leg, tuple[int, int]]
 
     def poll(
         self,
@@ -54,12 +54,15 @@ class State:
         alone, or producing a new state.
         """
 
-        self.liquidity_cache = {}
-
         balance_resp = try_multiple_clients(
-            ctx.clients["neutron"],
+            ctx.clients[list(ctx.deployments["auctions"].keys())[0]],
             lambda client: client.query_bank_balance(
-                Address(ctx.wallet.public_key(), prefix="neutron"),
+                Address(
+                    ctx.wallet.public_key(),
+                    prefix=list(ctx.deployments["auctions"].values())[0][
+                        "chain_prefix"
+                    ],
+                ),
                 ctx.cli_args["base_denom"],
             ),
         )
@@ -82,7 +85,7 @@ async def strategy(
     state = ctx.state
 
     if not state:
-        ctx.state = State(None, {})
+        ctx.state = State(None)
         state = ctx.state
 
     ctx = ctx.with_state(state.poll(ctx, pools, auctions))
@@ -121,9 +124,14 @@ async def strategy(
             await exec_arb(r, r.expected_profit, r.quantities, route, ctx)
 
             balance_after_resp = try_multiple_clients(
-                ctx.clients["neutron"],
+                ctx.clients[list(ctx.deployments["auctions"].keys())[0]],
                 lambda client: client.query_bank_balance(
-                    Address(ctx.wallet.public_key(), prefix="neutron"),
+                    Address(
+                        ctx.wallet.public_key(),
+                        prefix=list(ctx.deployments["auctions"].values())[0][
+                            "chain_prefix"
+                        ],
+                    ),
                     ctx.cli_args["base_denom"],
                 ),
             )
@@ -131,11 +139,25 @@ async def strategy(
             if balance_after_resp:
                 r.realized_profit = balance_after_resp - balance_prior
 
-            r.status = Status.EXECUTED
+            if r.route[-1].executed:
+                r.status = Status.EXECUTED
 
-            ctx.log_route(r, "info", "Executed route successfully", [])
-        except Exception as e:
-            ctx.log_route(r, "error", "Arb failed %s: %s", [fmt_route(route), e])
+                ctx.log_route(r, "info", "Executed route successfully", [])
+                ctx.log_route(
+                    r, "info", "Route executed with profit %d", [r.realized_profit]
+                )
+            else:
+                ctx.log_route(r, "info", "Route aborted", [])
+        except Exception:
+            ctx.log_route(
+                r,
+                "error",
+                "Arb failed %s: %s",
+                [
+                    fmt_route(route),
+                    traceback.format_exc().replace("\n", f"\n{r.uid}- Arb failed: "),
+                ],
+            )
 
             r.status = Status.FAILED
 
@@ -162,11 +184,34 @@ async def strategy(
 
         ctx.update_route(r)
 
-        ctx = ctx.with_state(state.poll(ctx, pools, auctions)).commit_history()
+        ctx = ctx.with_state(state.poll(ctx, pools, auctions))
+
+    ctx.commit_history()
 
     logger.info("Completed arbitrage round")
 
     return ctx
+
+
+def route_gas(route: list[Leg]) -> int:
+    """
+    Estimates the gas required to execute a route,
+    given that the base denom is untrn.
+    """
+
+    gas = 0
+
+    # Ensure that there is at least 5k of the base chain denom
+    # at all times
+    gas += int(sum((leg.backend.swap_fee for leg in route)))
+
+    for i, leg in enumerate(route[:-1]):
+        next_leg = route[i + 1]
+
+        if leg.backend.chain_id != next_leg.backend.chain_id:
+            gas += IBC_TRANSFER_GAS
+
+    return gas
 
 
 async def eval_route(
@@ -175,7 +220,9 @@ async def eval_route(
 ) -> Optional[tuple[Route, list[Leg]]]:
     r = ctx.queue_route(route, 0, 0, [])
 
-    ctx.log_route(r, "info", "Evaluating route for profitability", [])
+    ctx.log_route(
+        r, "info", "Evaluating route for profitability: %s", [fmt_route(route)]
+    )
 
     state = ctx.state
 
@@ -217,25 +264,23 @@ async def eval_route(
         ],
     )
 
-    gas_base_denom = 0
+    gas_base_denom = 0 if ctx.cli_args["base_denom"] != "untrn" else route_gas(route)
 
-    # Ensure that there is at least 5k of the base chain denom
-    # at all times
-    if ctx.cli_args["base_denom"] == "untrn":
-        gas_base_denom += sum([leg.backend.swap_fee for leg in route])
-
-        for i, leg in enumerate(route[:-1]):
-            next_leg = route[i + 1]
-
-            if leg.backend.chain_id != next_leg.backend.chain_id:
-                gas_base_denom += IBC_TRANSFER_GAS
+    ctx.log_route(
+        r,
+        "info",
+        "Route will cost %d to execute",
+        [
+            gas_base_denom,
+        ],
+    )
 
     starting_amt = state.balance - gas_base_denom
 
     ctx.log_route(
         r,
         "info",
-        "Route has investment ramp of %d",
+        "Route has starting amount of %d",
         [
             starting_amt,
         ],
@@ -300,7 +345,7 @@ async def listen_routes_with_depth_dfs(
     auctions: dict[str, dict[str, AuctionProvider]],
     ctx: Ctx[State],
 ) -> AsyncGenerator[tuple[Route, list[Leg]], None]:
-    denom_cache: dict[str, dict[str, str]] = {}
+    denom_cache: dict[str, dict[str, list[str]]] = {}
 
     start_pools: list[Union[AuctionProvider, PoolProvider]] = [
         *auctions.get(src, {}).values(),
@@ -323,7 +368,12 @@ async def listen_routes_with_depth_dfs(
 
         if len(path) >= 2 and not (
             path[-1].in_asset() == path[-2].out_asset()
-            or path[-1].in_asset() in denom_cache[path[-2].out_asset()].values()
+            or path[-1].in_asset()
+            in [
+                denom
+                for denom_list in denom_cache[path[-2].out_asset()].values()
+                for denom in denom_list
+            ]
         ):
             return
 
@@ -372,26 +422,25 @@ async def listen_routes_with_depth_dfs(
         if end not in denom_cache:
             try:
                 denom_infos = await denom_info(
-                    prev_pool.backend.chain_id,
-                    end,
-                    ctx.http_session,
-                    api_key=ctx.cli_args["skip_api_key"],
+                    prev_pool.backend.chain_id, end, ctx.http_session, ctx.denom_map
                 )
 
                 denom_cache[end] = {
-                    info.chain_id: info.denom
+                    info[0].chain_id: [i.denom for i in info]
                     for info in (
                         denom_infos
                         + [
-                            DenomChainInfo(
-                                denom=end,
-                                port=None,
-                                channel=None,
-                                chain_id=prev_pool.backend.chain_id,
-                            )
+                            [
+                                DenomChainInfo(
+                                    denom=end,
+                                    port=None,
+                                    channel=None,
+                                    chain_id=prev_pool.backend.chain_id,
+                                )
+                            ]
                         ]
                     )
-                    if info.chain_id
+                    if len(info) > 0 and info[0].chain_id
                 }
             except asyncio.TimeoutError:
                 return
@@ -441,7 +490,8 @@ async def listen_routes_with_depth_dfs(
                         ),
                         auction,
                     )
-                    for denom in denom_cache[end].values()
+                    for denom_set in denom_cache[end].values()
+                    for denom in denom_set
                     for auction in auctions.get(denom, {}).values()
                     if auction.chain_id != prev_pool.backend.chain_id
                 ),
@@ -459,7 +509,8 @@ async def listen_routes_with_depth_dfs(
                         ),
                         pool,
                     )
-                    for denom in denom_cache[end].values()
+                    for denom_set in denom_cache[end].values()
+                    for denom in denom_set
                     for pool_set in pools.get(denom, {}).values()
                     for pool in pool_set
                     if pool.chain_id != prev_pool.backend.chain_id
@@ -479,7 +530,12 @@ async def listen_routes_with_depth_dfs(
             async for route in streamer:
                 yield route
 
-    routes = stream.merge(*[next_legs([leg]) for leg in start_legs])
+    next_jobs = [next_legs([leg]) for leg in start_legs]
+
+    if len(next_jobs) == 0:
+        return
+
+    routes = stream.merge(*next_jobs)
 
     async with routes.stream() as streamer:
         async for route in streamer:

@@ -75,7 +75,6 @@ The auction arbitrage bot can be run with only one required environment variable
 
 * `-f` (`--pool_file`): Specifies which pools to use for the Neutron Astroport and Osmosis pool providers, and which routes to use for the Scheduler. Can also be used to cache requests required to obtain pool information.
 * `-p` (`--poll_interval`): Specifies how frequently the arbitrage strategy should be run (in seconds). The default value is `120`.
-* `-d` (`--discovery_interval`): Specifies how frequently new arbitrage routes should be discovered (in seconds). The default value is `600`.
 * `-nh` (`--hops`): Specifies the number of "hops" in a single arbitrage trade. The default value is `3`. Note that increasing this value increases the time for the discovery algorithm to run.
 * `-r` (`--require_leg_types`): Specifies the required arbitrage pool types to require trades include. Possible values include: auction osmosis astroport. Multiple leg types may be required, separated by spaces.
 * `-b` (`--base_denom`): Specifies the denom in which profits are denominated. The default value is the Neutron Noble USDC denom (`ibc/B559A80D62249C8AA07A380E2A2BEA6E5CA9A6F079C912C3A9E9B494105E4F81`)
@@ -99,8 +98,6 @@ python main.py --help
 
 The bot may also be supplied a command (an argument with no hyphens). The available commands are as follows:
 
-* `dump`: Loads all known pools, and writes discovered pools to a file, exiting immediately after. Results will be written in JSON format, following conventions outlined below.
-  * Sample execution: `WALLET_MNEMONIC=<wallet_mnemonic> python main.py dump`
 * `daemon`: Spawns the searcher event-loop as a long-running background "daemon" process, after initial setup. Exits the init script after spawning the daemon, leaving the daemon running in the background.
 * `hist`: Shows summary statistics for the bot's execution, including a lot of all recently completed orders.
 * `hist show <id>`: Shows execution logs for a particular order, as well as the execution plan for the order.
@@ -111,11 +108,11 @@ Custom RPC providers may be specified with the `--net_config` flag. This flag sp
 
 ```json
 {
-  "neutron": {
+  "neutron-1": {
     "http": ["https://neutron-rest.publicnode.com"],
 	"grpc": ["grpc+https://neutron-grpc.publicnode.com:443"]
   },
-  "osmosis": {
+  "osmosis-1": {
     "http": ["https://lcd.osmosis.zone"],
 	"grpc": ["https://osmosis-rpc.publicnode.com:443"]
   }

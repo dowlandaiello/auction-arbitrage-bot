@@ -2,12 +2,14 @@
 Defines common utilities shared across arbitrage strategies.
 """
 
+from itertools import groupby
+import json
+from decimal import Decimal
 import operator
 from functools import reduce
-from decimal import Decimal
 import logging
 import time
-from typing import Optional, Any
+from typing import Optional, Any, Iterator
 from src.contracts.route import Leg, Route
 from src.contracts.auction import AuctionProvider
 from src.contracts.pool.provider import PoolProvider
@@ -15,29 +17,37 @@ from src.contracts.pool.osmosis import OsmosisPoolProvider
 from src.contracts.pool.astroport import (
     NeutronAstroportPoolProvider,
 )
-
 from src.util import (
-    int_to_decimal,
     IBC_TRANSFER_TIMEOUT_SEC,
     IBC_TRANSFER_POLL_INTERVAL_SEC,
     try_multiple_rest_endpoints,
     try_multiple_clients_fatal,
     try_multiple_clients,
-    denom_info_on_chain,
     DENOM_QUANTITY_ABORT_ARB,
+    denom_route,
+    denom_info_on_chain,
 )
 from src.scheduler import Ctx
-import asyncio
 from cosmos.base.v1beta1 import coin_pb2
 from cosmpy.crypto.address import Address
 from cosmpy.aerial.tx import Transaction, SigningCfg
 from cosmpy.aerial.tx_helpers import SubmittedTx
+from cosmpy.aerial.wallet import LocalWallet
 from ibc.applications.transfer.v1 import tx_pb2
 
 logger = logging.getLogger(__name__)
 
 
-IBC_TRANSFER_GAS = 1000
+MAX_POOL_LIQUIDITY_TRADE = Decimal("0.1")
+
+"""
+The amount of the summed gas limit that will be consumed if messages
+are batched together.
+"""
+GAS_DISCOUNT_BATCHED = Decimal("0.9")
+
+
+IBC_TRANSFER_GAS = 5000
 
 
 def fmt_route_leg(leg: Leg) -> str:
@@ -49,7 +59,7 @@ def fmt_route_leg(leg: Leg) -> str:
         return "osmosis"
 
     if isinstance(leg.backend, NeutronAstroportPoolProvider):
-        return "astroport"
+        return f"astroport ({leg.backend.chain_id})"
 
     if isinstance(leg.backend, AuctionProvider):
         return "auction"
@@ -77,6 +87,48 @@ def fmt_route_debug(route: list[Leg]) -> str:
             route,
         )
     )
+
+
+def collapse_route(
+    route_legs_quantities: Iterator[tuple[Leg, int]]
+) -> list[list[tuple[Leg, int]]]:
+    """
+    Groups legs of the route by common consecutive chain ID's, meaning they can be
+    exceuted atomically.
+    """
+
+    return [
+        list(sublegs)
+        for _, sublegs in groupby(
+            route_legs_quantities, lambda r_q: r_q[0].backend.chain_id
+        )
+    ]
+
+
+def build_atomic_arb(
+    sublegs: list[tuple[Leg, int]], wallet: LocalWallet
+) -> Transaction:
+    """
+    Creates a transaction whose messages are the arb trades
+    in an atomic arb.
+    """
+
+    msgs = (
+        (
+            leg.backend.swap_msg_asset_b(wallet, to_swap, 0)
+            if leg.in_asset == leg.backend.asset_b
+            and not isinstance(leg.backend, AuctionProvider)
+            else leg.backend.swap_msg_asset_a(wallet, to_swap, 0)
+        )
+        for leg, to_swap in sublegs
+    )
+
+    tx = Transaction()
+
+    for msg in msgs:
+        tx.add_message(msg)
+
+    return tx
 
 
 async def exec_arb(
@@ -113,33 +165,39 @@ async def exec_arb(
     ctx.log_route(
         route_ent,
         "info",
-        ("Queueing candidpate arbitrage opportunity with " "route with %d hop(s): %s"),
+        "Queueing candidpate arbitrage opportunity with route with %d hop(s): %s",
         [len(route), fmt_route(route)],
     )
 
-    for leg, to_swap in zip(route, quantities):
-        balance_resp = try_multiple_clients(
-            ctx.clients[leg.backend.chain_id.split("-")[0]],
-            lambda client: client.query_bank_balance(
-                Address(ctx.wallet.public_key(), prefix=leg.backend.chain_prefix),
-                leg.in_asset(),
-            ),
-        )
+    to_execute: list[list[tuple[Leg, int]]] = collapse_route(zip(route, quantities))
 
-        if not balance_resp:
-            raise ValueError("Couldn't get balance.")
+    ctx.log_route(
+        route_ent,
+        "info",
+        "Queueing candidpate arbitrage opportunity with atomized execution plan: %s",
+        [
+            [fmt_route([leg for leg, _ in sublegs]) for sublegs in to_execute],
+        ],
+    )
 
-        to_swap = min(to_swap, balance_resp)
+    for sublegs in to_execute:
+        leg_to_swap: tuple[Leg, int] = sublegs[0]
+        (leg, to_swap) = leg_to_swap
+
+        # Log legs on the same chain
+        if len(sublegs) > 1:
+            ctx.log_route(
+                route_ent,
+                "info",
+                "%d legs are atomic and will be executed in one tx: %s",
+                [len(sublegs), fmt_route([leg for (leg, to_swap) in sublegs])],
+            )
 
         ctx.log_route(
             route_ent,
             "info",
-            "Queueing arb leg on %s with %s -> %s",
-            [
-                fmt_route_leg(leg),
-                leg.in_asset(),
-                leg.out_asset(),
-            ],
+            "Queueing arb legs: [%s]",
+            [fmt_route([leg for leg, _ in sublegs])],
         )
 
         tx: Optional[SubmittedTx] = None
@@ -147,12 +205,14 @@ async def exec_arb(
         ctx.log_route(
             route_ent,
             "info",
-            "Executing arb leg on %s with %d %s -> %s",
+            "Executing arb legs: [%s]",
             [
-                fmt_route_leg(leg),
-                to_swap,
-                leg.in_asset(),
-                leg.out_asset(),
+                ", ".join(
+                    (
+                        f"{fmt_route_leg(leg)} with {to_swap} {leg.in_asset()}"
+                        for (leg, to_swap) in sublegs
+                    )
+                )
             ],
         )
 
@@ -173,7 +233,12 @@ async def exec_arb(
             # Cancel arb if the transfer fails
             try:
                 await transfer(
-                    route_ent, prev_leg.out_asset(), prev_leg, leg, ctx, to_swap
+                    route_ent,
+                    prev_leg.out_asset(),
+                    prev_leg,
+                    leg,
+                    ctx,
+                    to_swap,
                 )
             except Exception as e:
                 ctx.log_route(
@@ -208,7 +273,7 @@ async def exec_arb(
             ctx.log_route(
                 route_ent,
                 "info",
-                "Arb leg can be executed atomically; no transfer necessary",
+                "Arb leg(s) can be executed on the same chain; no transfer necessary",
                 [],
             )
 
@@ -221,6 +286,81 @@ async def exec_arb(
             )
 
             return
+
+        # If there are multiple legs, build them as one large
+        # transaction
+        if len(sublegs) > 1:
+            tx = build_atomic_arb(sublegs, ctx.wallet)
+
+            acc = try_multiple_clients_fatal(
+                ctx.clients[leg.backend.chain_id],
+                lambda client: client.query_account(
+                    str(
+                        Address(
+                            ctx.wallet.public_key(),
+                            prefix=leg.backend.chain_prefix,
+                        )
+                    )
+                ),
+            )
+
+            ctx.log_route(route_ent, "info", "Built arb message chain", [])
+
+            gas_limit = int(
+                (
+                    sum((leg.backend.swap_gas_limit for leg, _ in sublegs))
+                    * GAS_DISCOUNT_BATCHED
+                )
+            )
+            gas = int(
+                gas_limit * sum((leg.backend.chain_gas_price for leg, _ in sublegs))
+            )
+
+            tx.seal(
+                signing_cfgs=SigningCfg.direct(ctx.wallet.public_key(), acc.sequence),
+                gas_limit=gas_limit,
+                fee=f"{gas}{leg.backend.chain_fee_denom}",
+            )
+            tx.sign(ctx.wallet.signer(), leg.backend.chain_id, acc.number)
+            tx.complete()
+
+            ctx.log_route(
+                route_ent,
+                "info",
+                "Submitting arb",
+                [],
+            )
+
+            tx = leg.backend.submit_swap_tx(tx).wait_to_complete()
+
+            # Notify the user of the arb trade
+            ctx.log_route(
+                route_ent,
+                "info",
+                "Executed legs %s: %s",
+                [
+                    ", ".join(
+                        (
+                            f"{fmt_route_leg(leg)} with {to_swap} {leg.in_asset()}"
+                            for (leg, to_swap) in sublegs
+                        )
+                    ),
+                    tx.tx_hash,
+                ],
+            )
+
+            for leg, _ in sublegs:
+                next(
+                    (
+                        leg_repr
+                        for leg_repr in route_ent.route
+                        if str(leg_repr) == str(leg)
+                    )
+                ).executed = True
+
+                prev_leg = leg
+
+            continue
 
         # If the arb leg is on astroport, simply execute the swap
         # on asset A, producing asset B
@@ -307,7 +447,7 @@ async def recover_funds(
     )
 
     balance_resp = try_multiple_clients(
-        ctx.clients[curr_leg.backend.chain_id.split("-")[0]],
+        ctx.clients[curr_leg.backend.chain_id],
         lambda client: client.query_bank_balance(
             Address(ctx.wallet.public_key(), prefix=curr_leg.backend.chain_prefix),
             curr_leg.in_asset(),
@@ -317,7 +457,21 @@ async def recover_funds(
     if not balance_resp:
         raise ValueError(f"Couldn't get balance for asset {curr_leg.in_asset()}.")
 
-    resp = await quantities_for_route_profit(balance_resp, backtracked, r, ctx)
+    if curr_leg.backend.chain_id != backtracked[0].backend.chain_id:
+        to_transfer = min(balance_resp, r.quantities[-2])
+
+        await transfer(
+            r,
+            curr_leg.in_asset(),
+            curr_leg,
+            backtracked[0],
+            ctx,
+            to_transfer,
+        )
+
+    resp = await quantities_for_route_profit(
+        balance_resp, backtracked, r, ctx, seek_profit=False
+    )
 
     if not resp:
         raise ValueError("Couldn't get execution plan.")
@@ -348,104 +502,162 @@ async def transfer(
     succeeded.
     """
 
-    denom_info = await denom_info_on_chain(
-        src_chain=prev_leg.backend.chain_id,
-        src_denom=denom,
-        dest_chain=leg.backend.chain_id,
-        session=ctx.http_session,
+    denom_infos_on_dest = await denom_info_on_chain(
+        prev_leg.backend.chain_id,
+        denom,
+        leg.backend.chain_id,
+        ctx.http_session,
+        ctx.denom_map,
     )
 
-    if not denom_info:
-        raise ValueError("Missing denom info for target chain in IBC transfer")
+    if not denom_infos_on_dest:
+        raise ValueError(
+            f"Missing denom info for transfer {denom} ({prev_leg.backend.chain_id}) -> {leg.backend.chain_id}"
+        )
 
-    channel_info = await try_multiple_rest_endpoints(
-        ctx.endpoints[leg.backend.chain_id.split("-")[0]]["http"],
-        f"/ibc/core/channel/v1/channels/{denom_info.channel}/ports/{denom_info.port}",
+    ibc_route = await denom_route(
+        prev_leg.backend.chain_id,
+        denom,
+        leg.backend.chain_id,
+        denom_infos_on_dest[0].denom,
         ctx.http_session,
     )
 
-    if not channel_info:
-        raise ValueError("Missing channel info for target chain in IBC transfer")
+    if not ibc_route or len(ibc_route) == 0:
+        raise ValueError(f"No route from {denom} to {leg.backend.chain_id}")
 
-    # Not enough info to complete the transfer
-    if not denom_info or not denom_info.port or not denom_info.channel:
-        raise ValueError("Missing channel info for target chain in IBC transfer")
-
-    acc = try_multiple_clients_fatal(
-        ctx.clients[prev_leg.backend.chain_id.split("-")[0]],
-        lambda client: client.query_account(
-            str(Address(ctx.wallet.public_key(), prefix=prev_leg.backend.chain_prefix))
-        ),
+    src_channel_id = ibc_route[0].channel
+    sender_addr = str(
+        Address(ctx.wallet.public_key(), prefix=ibc_route[0].from_chain.bech32_prefix)
+    )
+    receiver_addr = str(
+        Address(ctx.wallet.public_key(), prefix=ibc_route[0].to_chain.bech32_prefix)
     )
 
-    logger.debug(
-        "Executing IBC transfer %s from %s -> %s with source port %s, source channel %s, sender %s, and receiver %s",
+    memo: Optional[str] = None
+
+    for ibc_leg in reversed(ibc_route[1:]):
+        memo = json.dumps(
+            {
+                "forward": {
+                    "receiver": "pfm",
+                    "port": ibc_leg.port,
+                    "channel": ibc_leg.channel,
+                    "timeout": "10m",
+                    "retries": 2,
+                    "next": memo,
+                }
+            }
+        )
+
+    await transfer_raw(
         denom,
-        prev_leg.backend.chain_id,
-        leg.backend.chain_id,
-        channel_info["channel"]["counterparty"]["port_id"],
-        channel_info["channel"]["counterparty"]["channel_id"],
-        str(Address(ctx.wallet.public_key(), prefix=prev_leg.backend.chain_prefix)),
-        str(Address(ctx.wallet.public_key(), prefix=leg.backend.chain_prefix)),
+        ibc_route[0].from_chain.chain_id,
+        prev_leg.backend.chain_fee_denom,
+        src_channel_id,
+        ibc_route[0].to_chain.chain_id,
+        sender_addr,
+        receiver_addr,
+        ctx,
+        swap_balance,
+        memo=memo,
     )
+
+
+async def transfer_raw(
+    denom: str,
+    src_chain_id: str,
+    src_chain_fee_denom: str,
+    src_channel_id: str,
+    dest_chain_id: str,
+    sender_addr: str,
+    receiver_addr: str,
+    ctx: Ctx[Any],
+    swap_balance: int,
+    memo: Optional[str] = None,
+    route: Optional[Route] = None,
+) -> None:
+    """
+    Synchronously executes an IBC transfer from one leg in an arbitrage
+    trade to the next, moving `swap_balance` of the asset_b in the source
+    leg to asset_a in the destination leg. Returns true if the transfer
+    succeeded.
+    """
 
     # Create a messate transfering the funds
-    msg = tx_pb2.MsgTransfer(  # pylint: disable=no-member
-        source_port=channel_info["channel"]["counterparty"]["port_id"],
-        source_channel=channel_info["channel"]["counterparty"]["channel_id"],
-        sender=str(
-            Address(ctx.wallet.public_key(), prefix=prev_leg.backend.chain_prefix)
-        ),
-        receiver=str(Address(ctx.wallet.public_key(), prefix=leg.backend.chain_prefix)),
-        timeout_timestamp=time.time_ns() + 600 * 10**9,
+    msg = (
+        tx_pb2.MsgTransfer(  # pylint: disable=no-member
+            source_port="transfer",
+            source_channel=src_channel_id,
+            sender=sender_addr,
+            receiver=receiver_addr,
+            timeout_timestamp=time.time_ns() + 600 * 10**9,
+            memo=memo,
+        )
+        if memo
+        else tx_pb2.MsgTransfer(  # pylint: disable=no-member
+            source_port="transfer",
+            source_channel=src_channel_id,
+            sender=sender_addr,
+            receiver=receiver_addr,
+            timeout_timestamp=time.time_ns() + 600 * 10**9,
+        )
     )
+
     msg.token.CopyFrom(
         coin_pb2.Coin(  # pylint: disable=maybe-no-member
             denom=denom, amount=str(swap_balance)
         )
     )
 
+    acc = try_multiple_clients_fatal(
+        ctx.clients[src_chain_id],
+        lambda client: client.query_account(str(sender_addr)),
+    )
+
     tx = Transaction()
     tx.add_message(msg)
     tx.seal(
         SigningCfg.direct(ctx.wallet.public_key(), acc.sequence),
-        f"3000{prev_leg.backend.chain_fee_denom}",
-        50000,
+        f"100000{src_chain_fee_denom}",
+        1000000,
     )
-    tx.sign(ctx.wallet.signer(), prev_leg.backend.chain_id, acc.number)
+    tx.sign(ctx.wallet.signer(), src_chain_id, acc.number)
     tx.complete()
 
     submitted = try_multiple_clients_fatal(
-        ctx.clients[prev_leg.backend.chain_id.split("-")[0]],
+        ctx.clients[src_chain_id],
         lambda client: client.broadcast_tx(tx),
     ).wait_to_complete()
 
-    ctx.log_route(
-        route,
-        "info",
-        "Submitted IBC transfer from src %s to %s: %s",
-        [
-            prev_leg.backend.chain_id,
-            leg.backend.chain_id,
-            submitted.tx_hash,
-        ],
-    )
+    if route:
+        ctx.log_route(
+            route,
+            "info",
+            "Submitted IBC transfer from src %s to %s: %s",
+            [
+                src_chain_id,
+                dest_chain_id,
+                submitted.tx_hash,
+            ],
+        )
 
     # Continuously check for a package acknowledgement
     # or cancel the arb if the timeout passes
     # Future note: This could be async so other arbs can make
     # progress while this is happening
     async def transfer_or_continue() -> bool:
-        ctx.log_route(
-            route, "info", "Checking IBC transfer status %s", [submitted.tx_hash]
-        )
+        if route:
+            ctx.log_route(
+                route, "info", "Checking IBC transfer status %s", [submitted.tx_hash]
+            )
 
         # Check for a package acknowledgement by querying osmosis
         ack_resp = await try_multiple_rest_endpoints(
-            leg.backend.endpoints,
+            ctx.endpoints[src_chain_id]["http"],
             (
-                f"/ibc/core/channel/v1/channels/{denom_info.channel}/"
-                f"ports/{denom_info.port}/packet_acks/"
+                f"/ibc/core/channel/v1/channels/{src_channel_id}/"
+                f"ports/transfer/packet_acks/"
                 f"{submitted.response.events['send_packet']['packet_sequence']}"
             ),
             ctx.http_session,
@@ -453,12 +665,13 @@ async def transfer(
 
         # try again
         if not ack_resp:
-            ctx.log_route(
-                route,
-                "info",
-                "IBC transfer %s has not yet completed; waiting...",
-                [submitted.tx_hash],
-            )
+            if route:
+                ctx.log_route(
+                    route,
+                    "info",
+                    "IBC transfer %s has not yet completed; waiting...",
+                    [submitted.tx_hash],
+                )
 
             return False
 
@@ -470,8 +683,10 @@ async def transfer(
     while time.time() < timeout:
         time.sleep(IBC_TRANSFER_POLL_INTERVAL_SEC)
 
-        if asyncio.run(transfer_or_continue()):
-            break
+        if await transfer_or_continue():
+            return
+
+    raise ValueError("IBC transfer timed out.")
 
 
 async def quantities_for_route_profit(
@@ -479,6 +694,7 @@ async def quantities_for_route_profit(
     route: list[Leg],
     r: Route,
     ctx: Ctx[Any],
+    seek_profit: Optional[bool] = True,
 ) -> tuple[int, list[int]]:
     """
     Calculates what quantities should be used to obtain
@@ -490,7 +706,9 @@ async def quantities_for_route_profit(
 
     quantities: list[int] = [starting_amount]
 
-    while quantities[-1] - quantities[0] <= 0:
+    while (seek_profit and quantities[-1] - quantities[0] <= 0) or len(
+        quantities
+    ) <= len(route):
         ctx.log_route(r, "info", "Route has possible execution plan: %s", [quantities])
 
         if starting_amount < DENOM_QUANTITY_ABORT_ARB:
@@ -522,9 +740,7 @@ async def quantities_for_route_profit(
 
                 quantities.append(
                     min(
-                        int(
-                            int_to_decimal(await leg.backend.exchange_rate()) * prev_amt
-                        ),
+                        int(await leg.backend.exchange_rate() * prev_amt),
                         await leg.backend.remaining_asset_b(),
                     )
                 )
@@ -536,9 +752,27 @@ async def quantities_for_route_profit(
                     int(await leg.backend.simulate_swap_asset_a(prev_amt))
                 )
 
+                pool_liquidity = await leg.backend.balance_asset_b()
+
+                if (
+                    pool_liquidity == 0
+                    or Decimal(quantities[-1]) / Decimal(pool_liquidity)
+                    > MAX_POOL_LIQUIDITY_TRADE
+                ):
+                    break
+
                 continue
 
             quantities.append(int(await leg.backend.simulate_swap_asset_b(prev_amt)))
+
+            pool_liquidity = await leg.backend.balance_asset_a()
+
+            if (
+                pool_liquidity == 0
+                or Decimal(quantities[-1]) / Decimal(pool_liquidity)
+                > MAX_POOL_LIQUIDITY_TRADE
+            ):
+                break
 
         starting_amount = int(Decimal(starting_amount) / Decimal(2.0))
 
@@ -569,7 +803,7 @@ async def route_base_denom_profit(
             if await leg.backend.remaining_asset_b() == 0:
                 return 0
 
-            exchange_rates.append(int_to_decimal(await leg.backend.exchange_rate()))
+            exchange_rates.append(await leg.backend.exchange_rate())
 
             continue
 
